@@ -37,6 +37,9 @@ local CONFIG = {
   granularity = "app+window+title", -- "app+window+title" | "app+window" | "app"
   logPath = os.getenv("HOME") .. "/screen-stays.csv",
   minLogSeconds = 2,           -- don't log accidental <2s flickers
+  nameWidth = 18,              -- menu bar: name field is exactly this many
+                               -- chars (padded, or cut with …). The clock
+                               -- after it is never truncated. (v3.12)
 }
 
 local menubar = hs.menubar.new()
@@ -641,7 +644,19 @@ local function tick()
   -- Chrome apps: label with the session (first segment of the AX title)
   local display = name
   if axTitle ~= "" then display = axTitle:match("^(.-) %- ") or axTitle end
-  local label = (display ~= "" and display .. " " or "") .. fmt(os.time() - startTime)
+  -- Fixed-width name field (v3.12): pad short names, cut long ones with
+  -- an ellipsis, so the clock never moves and is never truncated.
+  local function fixedName(s, width)
+    local okLen, len = pcall(function() return utf8.len(s) end)
+    if not okLen or not len then len = #s end
+    if len > width then
+      local okCut, cut = pcall(function() return s:sub(1, utf8.offset(s, width) - 1) end)
+      if okCut and cut then return cut .. "…" end
+      return s:sub(1, width - 1) .. "…"
+    end
+    return s .. string.rep(" ", width - len)
+  end
+  local label = fixedName(display, CONFIG.nameWidth) .. " " .. fmt(os.time() - startTime)
   if menubar then menubar:setTitle("◉ " .. label) end
 end
 
