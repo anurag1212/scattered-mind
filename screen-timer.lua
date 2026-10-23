@@ -219,6 +219,33 @@ local function bar(value, max, width)
   return string.rep("█", filled) .. string.rep("░", width - filled)
 end
 
+-- Stay-length buckets shared by the day histogram and the per-app
+-- sparklines: <10s, 10-30s, 30s-2m, 2-10m, 10-25m, >=25m.
+local BUCKETS = {
+  { "<10s", 0, 9 }, { "10-30s", 10, 29 }, { "30s-2m", 30, 119 },
+  { "2-10m", 120, 599 }, { "10-25m", 600, 1499 }, { "≥25m", 1500, math.huge },
+}
+local SPARK = { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" }
+-- Per-app stay-length DISTRIBUTION as a 6-glyph sparkline (v3.8, replaces
+-- the old share-of-total bar, which only compared totals between apps).
+-- Each glyph is one bucket, height = stay count in it, scaled to the
+-- app's fullest bucket. Zero-count buckets render as the baseline ▁.
+local function sparkline(secsList)
+  local counts, maxCount = {}, 0
+  for i, b in ipairs(BUCKETS) do
+    counts[i] = 0
+    for _, d in ipairs(secsList) do if d >= b[2] and d <= b[3] then counts[i] = counts[i] + 1 end end
+    if counts[i] > maxCount then maxCount = counts[i] end
+  end
+  if maxCount == 0 then return string.rep("▁", #BUCKETS) end
+  local out = {}
+  for i = 1, #BUCKETS do
+    local idx = counts[i] == 0 and 1 or (1 + math.ceil(counts[i] / maxCount * 7))
+    out[i] = SPARK[idx]
+  end
+  return table.concat(out)
+end
+
 local function stats()
   if #staysToday == 0 then return { "No finished stays yet today" } end
   -- loginwindow = locked/idle screen. Its "stays" (e.g. 11h overnight)
@@ -265,20 +292,18 @@ local function stats()
     lines[#lines + 1] = string.format("Locked (loginwindow): %s — excluded above", fmt(lockedTotal))
   end
   -- Duration histogram: where the day actually went, bucket by bucket.
+  -- Bar comes FIRST (v3.8): menu text is a proportional font, so padded
+  -- labels never align — a fixed-width bar at column 0 always does.
   lines[#lines + 1] = "—"
   lines[#lines + 1] = "Stay lengths:"
-  local buckets = {
-    { "<10s", 0, 9 }, { "10-30s", 10, 29 }, { "30s-2m", 30, 119 },
-    { "2-10m", 120, 599 }, { "10-25m", 600, 1499 }, { "≥25m", 1500, math.huge },
-  }
   local counts, maxCount = {}, 0
-  for i, b in ipairs(buckets) do
+  for i, b in ipairs(BUCKETS) do
     counts[i] = 0
     for _, d in ipairs(durations) do if d >= b[2] and d <= b[3] then counts[i] = counts[i] + 1 end end
     if counts[i] > maxCount then maxCount = counts[i] end
   end
-  for i, b in ipairs(buckets) do
-    lines[#lines + 1] = string.format("%-7s %s %d", b[1], bar(counts[i], maxCount, 14), counts[i])
+  for i, b in ipairs(BUCKETS) do
+    lines[#lines + 1] = string.format("%s %s · %d", bar(counts[i], maxCount, 14), b[1], counts[i])
   end
   lines[#lines + 1] = "—"
   lines[#lines + 1] = "By app:"
@@ -297,8 +322,11 @@ local function stats()
       otherAppTotal = otherAppTotal + entry.data.total
     else
       local a = entry.data
+      -- Leading glyphs are the app's stay-length distribution sparkline
+      -- (buckets <10s .. ≥25m, height = stays in bucket). Fixed 6 chars
+      -- at column 0 keeps every app's columns vertically aligned.
       lines[#lines + 1] = string.format("%s %s — %d stays, %s total, median %s",
-        bar(a.total, appList[1].data.total, 10), entry.name, #a.secs, fmt(a.total), fmt(medianOf(a.secs)))
+        sparkline(a.secs), entry.name, #a.secs, fmt(a.total), fmt(medianOf(a.secs)))
       -- Within-app breakdown, only when the app actually has distinct
       -- windows/tabs/sessions (Chrome, PWAs like Metamate, multi-doc apps)
       local subList, subCount = {}, 0
