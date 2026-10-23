@@ -80,24 +80,72 @@ end
 -- For Chrome apps only: find the session/page title hidden in the AX tree.
 -- Probe-verified shape: AXWindow -> AXGroup with AXTitle = "<session> - ..."
 -- BFS, depth <= 6, node-capped — the Metamate tree was only ~14 elements.
-local function axTitleFor(win)
+local function axAttr(el, name)
+  local ok, v = pcall(function() return el:attributeValue(name) end)
+  if ok then return v end
+  return nil
+end
+
+-- BFS the window's AX tree; visit(el, depth) returns a string to stop with
+-- that value, or nil to keep walking.
+local function axWalk(win, visit)
   local okAX, ax = pcall(function() return hs.axuielement.windowElement(win) end)
   if not okAX or not ax then return "" end
   local queue, seen = { { ax, 0 } }, 0
   local head = 1
-  while head <= #queue and seen < 200 do
+  while head <= #queue and seen < 300 do
     local el, depth = queue[head][1], queue[head][2]
     head = head + 1; seen = seen + 1
-    local okT, t = pcall(function() return el:attributeValue("AXTitle") end)
-    if okT and type(t) == "string" and t ~= "" then return t end
-    if depth < 6 then
-      local okK, kids = pcall(function() return el:attributeValue("AXChildren") end)
-      if okK and type(kids) == "table" then
+    local hit = visit(el, depth)
+    if hit then return hit end
+    if depth < 7 then
+      local kids = axAttr(el, "AXChildren")
+      if type(kids) == "table" then
         for _, k in ipairs(kids) do queue[#queue + 1] = { k, depth + 1 } end
       end
     end
   end
   return ""
+end
+
+-- Selected tab title for tabbed apps (iTerm2, Terminal.app): their tabs
+-- live in an AXTabGroup of AXRadioButtons; the selected one carries the
+-- tab's name. This is how tab switches inside one window become visible —
+-- the window itself never changes. (v3.6)
+local function selectedTabTitle(win)
+  return axWalk(win, function(el)
+    if axAttr(el, "AXRole") == "AXTabGroup" then
+      local tabs = axAttr(el, "AXChildren")
+      if type(tabs) == "table" then
+        for _, tab in ipairs(tabs) do
+          if axAttr(tab, "AXRole") == "AXRadioButton" then
+            local sel = axAttr(tab, "AXSelected")
+            local val = axAttr(tab, "AXValue")
+            if sel == true or val == true or val == 1 then
+              local t = axAttr(tab, "AXTitle")
+              if type(t) == "string" and t ~= "" then return t end
+            end
+          end
+        end
+      end
+    end
+    return nil
+  end)
+end
+
+local TAB_BUNDLES = { ["com.googlecode.iterm2"] = true, ["com.apple.Terminal"] = true }
+
+local function axTitleFor(win, bundle)
+  if bundle and TAB_BUNDLES[bundle] then
+    local tab = selectedTabTitle(win)
+    if tab ~= "" then return tab end
+    -- fall through to generic title search if no tab group was found
+  end
+  return axWalk(win, function(el)
+    local t = axAttr(el, "AXTitle")
+    if type(t) == "string" and t ~= "" then return t end
+    return nil
+  end)
 end
 
 -- Debounced AX title. v3: raw AX title in the key — streaming UI made it
@@ -112,15 +160,15 @@ end
 -- logged to ~/screen-timer-debug.log. All AX work is pcall-wrapped so
 -- an AX error can never kill the 1s tick.
 local stableAx, candAx, candHits, candExpires, axWinKey = "", "", 0, 0, ""
-local function debouncedAx(win, winKey)
+local function debouncedAx(win, winKey, bundle)
   if winKey ~= axWinKey then -- new window: accept immediately
     axWinKey = winKey
-    local ok, raw = pcall(axTitleFor, win)
+    local ok, raw = pcall(axTitleFor, win, bundle)
     stableAx = (ok and raw) or ""
     candAx, candHits = "", 0
     return stableAx
   end
-  local ok, raw = pcall(axTitleFor, win)
+  local ok, raw = pcall(axTitleFor, win, bundle)
   if not ok or raw == nil or raw == "" then
     if os.time() > candExpires then candAx, candHits = "", 0 end
     return stableAx
@@ -151,8 +199,8 @@ local function frontmost()
     local ok, id = pcall(function() return win:id() end)
     if ok and id then winId = tostring(id) end
     local okB, bundle = pcall(function() return app:bundleID() end)
-    if okB and bundle and bundle:find("^com%.google%.Chrome%.app%.") then
-      axTitle = debouncedAx(win, name .. "|" .. winId)
+    if okB and bundle and (bundle:find("^com%.google%.Chrome%.app%.") or TAB_BUNDLES[bundle]) then
+      axTitle = debouncedAx(win, name .. "|" .. winId, bundle)
     end
   end
   local key
@@ -191,11 +239,25 @@ end
 -- all lines were \n-joined into a single menu item title — Hammerspoon /
 -- AppKit menu items don't render newlines, so the whole summary showed
 -- as one big line.
+-- Simple unicode bar: bar(50, 100, 10) -> "█████░░░░░"
+local function bar(value, max, width)
+  if max <= 0 then return string.rep("░", width) end
+  local filled = math.floor(value / max * width + 0.5)
+  if filled > width then filled = width end
+  return string.rep("█", filled) .. string.rep("░", width - filled)
+end
+
 local function stats()
   if #staysToday == 0 then return { "No finished stays yet today" } end
-  local durations, totalSum = {}, 0
+  -- loginwindow = locked/idle screen. Its "stays" (e.g. 11h overnight)
+  -- poison every other stat, so they're split out and only reported as
+  -- a single locked total. (v3.6)
+  local durations, totalSum, lockedTotal = {}, 0, 0
   local apps = {} -- name -> {secs={}, total=0, subs={label->{count,total}}}
   for _, r in ipairs(staysToday) do
+    if r.app == "loginwindow" then
+      lockedTotal = lockedTotal + r.sec
+    else
     durations[#durations + 1] = r.sec; totalSum = totalSum + r.sec
     local a = apps[r.app]; if not a then a = { secs = {}, total = 0, subs = {} }; apps[r.app] = a end
     a.secs[#a.secs + 1] = r.sec; a.total = a.total + r.sec
@@ -209,12 +271,45 @@ local function stats()
     if #sub > 45 then sub = sub:sub(1, 42) .. "..." end
     local s = a.subs[sub]; if not s then s = { count = 0, total = 0 }; a.subs[sub] = s end
     s.count = s.count + 1; s.total = s.total + r.sec
+    end
+  end
+  if #durations == 0 then
+    return { "No active stays yet today",
+      string.format("Locked (loginwindow): %s", fmt(lockedTotal)) }
   end
   table.sort(durations)
-  local lines = { string.format("Stays today: %d", #durations),
-    string.format("Median: %s  •  Average: %s  •  Longest: %s",
-      fmt(medianOf(durations)), fmt(math.floor(totalSum / #durations)), fmt(durations[#durations])),
-    "—", "By app:" }
+  -- Focus vs fragmentation: the shape of the day matters more than the
+  -- median. Count deep stays (>=25 min) and flutter (<30s).
+  local focusCount, focusTotal, flutter = 0, 0, 0
+  for _, d in ipairs(durations) do
+    if d >= 1500 then focusCount = focusCount + 1; focusTotal = focusTotal + d end
+    if d < 30 then flutter = flutter + 1 end
+  end
+  local lines = { string.format("Stays today: %d  •  Active: %s", #durations, fmt(totalSum)),
+    string.format("Median: %s  •  Longest: %s", fmt(medianOf(durations)), fmt(durations[#durations])),
+    string.format("Focus ≥25m: %d stays, %s  •  <30s: %d%% of stays",
+      focusCount, fmt(focusTotal), math.floor(flutter / #durations * 100 + 0.5)) }
+  if lockedTotal > 0 then
+    lines[#lines + 1] = string.format("Locked (loginwindow): %s — excluded above", fmt(lockedTotal))
+  end
+  -- Duration histogram: where the day actually went, bucket by bucket.
+  lines[#lines + 1] = "—"
+  lines[#lines + 1] = "Stay lengths:"
+  local buckets = {
+    { "<10s", 0, 9 }, { "10-30s", 10, 29 }, { "30s-2m", 30, 119 },
+    { "2-10m", 120, 599 }, { "10-25m", 600, 1499 }, { "≥25m", 1500, math.huge },
+  }
+  local counts, maxCount = {}, 0
+  for i, b in ipairs(buckets) do
+    counts[i] = 0
+    for _, d in ipairs(durations) do if d >= b[2] and d <= b[3] then counts[i] = counts[i] + 1 end end
+    if counts[i] > maxCount then maxCount = counts[i] end
+  end
+  for i, b in ipairs(buckets) do
+    lines[#lines + 1] = string.format("%-7s %s %d", b[1], bar(counts[i], maxCount, 14), counts[i])
+  end
+  lines[#lines + 1] = "—"
+  lines[#lines + 1] = "By app:"
   local appList = {}
   for name, a in pairs(apps) do appList[#appList + 1] = { name = name, data = a } end
   table.sort(appList, function(x, y) return x.data.total > y.data.total end)
@@ -230,8 +325,8 @@ local function stats()
       otherAppTotal = otherAppTotal + entry.data.total
     else
       local a = entry.data
-      lines[#lines + 1] = string.format("%s — %d stays, %s total, median %s",
-        entry.name, #a.secs, fmt(a.total), fmt(medianOf(a.secs)))
+      lines[#lines + 1] = string.format("%s %s — %d stays, %s total, median %s",
+        bar(a.total, appList[1].data.total, 10), entry.name, #a.secs, fmt(a.total), fmt(medianOf(a.secs)))
       -- Within-app breakdown, only when the app actually has distinct
       -- windows/tabs/sessions (Chrome, PWAs like Metamate, multi-doc apps)
       local subList, subCount = {}, 0
