@@ -372,15 +372,19 @@ end
 
 if menubar then
   menubar:setMenu(function()
+    -- Info lines are NOT disabled on purpose (v3.7): macOS renders
+    -- disabled menu items in gray — text and unicode bars alike — which
+    -- made the whole summary look washed out. Enabled items with no fn
+    -- render in full black and do nothing when clicked.
     local items = {
-      { title = (currentAx ~= "" and ("AX session: " .. (currentAx:match("^(.-) %- ") or currentAx)) or "AX session: (none)"), disabled = true },
+      { title = (currentAx ~= "" and ("AX session: " .. (currentAx:match("^(.-) %- ") or currentAx)) or "AX session: (none)") },
       { title = "-" },
     }
     for _, line in ipairs(stats()) do
       if line == "—" then
         items[#items + 1] = { title = "-" }
       else
-        items[#items + 1] = { title = line, disabled = true }
+        items[#items + 1] = { title = line }
       end
     end
     items[#items + 1] = { title = "-" }
