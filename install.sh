@@ -600,18 +600,27 @@ document.getElementById("apps").innerHTML = DATA.apps.map(a=>{
 ]==]
 
 local function openDashboard()
-  local html = DASHBOARD_HTML:gsub("__DATA__", function() return dashboardJSON() end)
+  -- Toggle (v3.10): choosing "Open dashboard" while it's open closes it.
+  -- (v3.9 had no close path short of Reload Config — sorry.) Esc also
+  -- closes it via closeOnEscape where supported, and deleting the
+  -- webview when its window is closed by hand keeps the toggle in sync.
   if SCREEN_TIMER and SCREEN_TIMER.webview then
     local wv = SCREEN_TIMER.webview
-    wv:html(html)
-    wv:show()
-    wv:bringToFront(true)
+    SCREEN_TIMER.webview = nil
+    pcall(function() wv:delete() end)
     return
   end
+  local html = DASHBOARD_HTML:gsub("__DATA__", function() return dashboardJSON() end)
   local sf = hs.screen.mainScreen():frame()
   local rect = { x = sf.x + (sf.w - 900) / 2, y = sf.y + (sf.h - 680) / 2, w = 900, h = 680 }
   local wv = hs.webview.new(rect)
-  wv:windowTitle("Screen Timer — Dashboard")
+  wv:windowTitle("Screen Timer — Dashboard (menu item or Esc closes)")
+  pcall(function() wv:closeOnEscape(true) end)
+  pcall(function()
+    wv:windowCallback(function(action)
+      if action == "closing" and SCREEN_TIMER then SCREEN_TIMER.webview = nil end
+    end)
+  end)
   wv:html(html)
   wv:show()
   wv:bringToFront(true)
@@ -651,7 +660,7 @@ if menubar then
       end
     end
     items[#items + 1] = { title = "-" }
-    items[#items + 1] = { title = "Open dashboard", fn = function() local ok, err = pcall(openDashboard); if not ok then hs.alert.show("Dashboard error: " .. tostring(err)) end end },
+    items[#items + 1] = { title = "Open dashboard / close", fn = function() local ok, err = pcall(openDashboard); if not ok then hs.alert.show("Dashboard error: " .. tostring(err)) end end },
     { title = "Open log (CSV)", fn = function() os.execute('open "' .. CONFIG.logPath .. '"') end }
     items[#items + 1] = { title = "Reset timer now", fn = function() startTime = os.time() end }
     return items
