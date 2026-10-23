@@ -207,6 +207,64 @@ local function medianOf(list)
   return s[math.ceil(#s / 2)]
 end
 
+local function csvParseLine(line)
+  local fields, i, n = {}, 1, #line
+  while i <= n do
+    local c = line:sub(i, i)
+    if c == '"' then
+      local buf, j = {}, i + 1
+      while j <= n do
+        local ch = line:sub(j, j)
+        if ch == '"' then
+          if line:sub(j + 1, j + 1) == '"' then buf[#buf + 1] = '"'; j = j + 2
+          else j = j + 1; break end
+        else buf[#buf + 1] = ch; j = j + 1 end
+      end
+      fields[#fields + 1] = table.concat(buf)
+      if line:sub(j, j) == "," then i = j + 1 else i = n + 1 end
+    else
+      local j = line:find(",", i, true)
+      if j then fields[#fields + 1] = line:sub(i, j - 1); i = j + 1
+      else fields[#fields + 1] = line:sub(i); i = n + 1 end
+    end
+  end
+  return fields
+end
+
+local function jsonEsc(s)
+  return (tostring(s):gsub('[%z\1-\31\\"]', function(c)
+    if c == '"' then return '\\"' end
+    if c == "\\" then return "\\\\" end
+    return string.format("\\u%04x", c:byte())
+  end))
+end
+
+local function dayStaysFromCSV()
+  local today = os.date("%Y-%m-%d")
+  local f = io.open(CONFIG.logPath, "r")
+  if not f then return {} end
+  local out = {}
+  for line in f:lines() do
+    if line:sub(1, 10) == today then
+      local fld = csvParseLine(line)
+      -- end_time,app,window_id,window_title,ax_title,duration_seconds
+      if #fld >= 6 then
+        local y, mo, d, h, mi, s = fld[1]:match("(%d+)-(%d+)-(%d+) (%d+):(%d+):(%d+)")
+        local dur = tonumber(fld[6])
+        if y and dur then
+          local endT = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+            hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
+          out[#out + 1] = { app = fld[2], title = fld[4], ax = fld[5],
+            dur = dur, startT = endT - dur, endT = endT }
+        end
+      end
+    end
+  end
+  f:close()
+  table.sort(out, function(a, b) return a.startT < b.startT end)
+  return out
+end
+
 -- Returns a TABLE of lines, one line per menu item (v3.3). Before this,
 -- all lines were \n-joined into a single menu item title — Hammerspoon /
 -- AppKit menu items don't render newlines, so the whole summary showed
@@ -247,13 +305,20 @@ local function sparkline(secsList)
 end
 
 local function stats()
-  if #staysToday == 0 then return { "No finished stays yet today" } end
+  -- Source of truth is the CSV (v3.11): the old in-memory staysToday was
+  -- wiped by every config reload while the dashboard (CSV-based) kept
+  -- the full day. Menu and dashboard now read the same data.
+  local records = {}
+  for _, st in ipairs(dayStaysFromCSV()) do
+    records[#records + 1] = { sec = st.dur, app = st.app, title = st.title, ax = st.ax }
+  end
+  if #records == 0 then return { "No finished stays yet today" } end
   -- loginwindow = locked/idle screen. Its "stays" (e.g. 11h overnight)
   -- poison every other stat, so they're split out and only reported as
   -- a single locked total. (v3.6)
   local durations, totalSum, lockedTotal = {}, 0, 0
   local apps = {} -- name -> {secs={}, total=0, subs={label->{count,total}}}
-  for _, r in ipairs(staysToday) do
+  for _, r in ipairs(records) do
     if r.app == "loginwindow" then
       lockedTotal = lockedTotal + r.sec
     else
@@ -361,64 +426,6 @@ end
 -- the pretty layer: an hs.webview panel with a colored day timeline and
 -- per-app stay histograms, Stats-app style. Data comes from today's CSV
 -- rows (so it survives config reloads), plus the in-progress stay.
-
-local function csvParseLine(line)
-  local fields, i, n = {}, 1, #line
-  while i <= n do
-    local c = line:sub(i, i)
-    if c == '"' then
-      local buf, j = {}, i + 1
-      while j <= n do
-        local ch = line:sub(j, j)
-        if ch == '"' then
-          if line:sub(j + 1, j + 1) == '"' then buf[#buf + 1] = '"'; j = j + 2
-          else j = j + 1; break end
-        else buf[#buf + 1] = ch; j = j + 1 end
-      end
-      fields[#fields + 1] = table.concat(buf)
-      if line:sub(j, j) == "," then i = j + 1 else i = n + 1 end
-    else
-      local j = line:find(",", i, true)
-      if j then fields[#fields + 1] = line:sub(i, j - 1); i = j + 1
-      else fields[#fields + 1] = line:sub(i); i = n + 1 end
-    end
-  end
-  return fields
-end
-
-local function jsonEsc(s)
-  return (tostring(s):gsub('[%z\1-\31\\"]', function(c)
-    if c == '"' then return '\\"' end
-    if c == "\\" then return "\\\\" end
-    return string.format("\\u%04x", c:byte())
-  end))
-end
-
-local function dayStaysFromCSV()
-  local today = os.date("%Y-%m-%d")
-  local f = io.open(CONFIG.logPath, "r")
-  if not f then return {} end
-  local out = {}
-  for line in f:lines() do
-    if line:sub(1, 10) == today then
-      local fld = csvParseLine(line)
-      -- end_time,app,window_id,window_title,ax_title,duration_seconds
-      if #fld >= 6 then
-        local y, mo, d, h, mi, s = fld[1]:match("(%d+)-(%d+)-(%d+) (%d+):(%d+):(%d+)")
-        local dur = tonumber(fld[6])
-        if y and dur then
-          local endT = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
-            hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
-          out[#out + 1] = { app = fld[2], title = fld[4], ax = fld[5],
-            dur = dur, startT = endT - dur, endT = endT }
-        end
-      end
-    end
-  end
-  f:close()
-  table.sort(out, function(a, b) return a.startT < b.startT end)
-  return out
-end
 
 local function dashboardJSON()
   local stays = dayStaysFromCSV()
@@ -531,7 +538,12 @@ h2{font-size:13px;font-weight:700;margin:16px 0 8px;opacity:.85}
 .subs div{display:flex;justify-content:space-between;font-size:12px;padding:1.5px 0}
 .subs .t{opacity:.6;white-space:nowrap;margin-left:14px}
 .subs .l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.winbtns{position:fixed;top:12px;right:14px;display:flex;gap:6px;z-index:10}
+.winbtns button{width:26px;height:26px;border-radius:50%;border:1px solid rgba(128,128,128,.35);background:rgba(128,128,128,.14);color:CanvasText;font-size:13px;line-height:1;cursor:pointer}
+.winbtns button:hover{background:rgba(128,128,128,.3)}
+#x:hover{background:#e81123;color:#fff;border-color:#e81123}
 </style></head><body>
+<div class="winbtns"><button id="rf" title="Refresh">↻</button><button id="x" title="Close">✕</button></div>
 <h1>Screen Timer — <span id="date"></span></h1>
 <div class="sub">Stays so far today. The panel reflects the moment it was opened — reopen to refresh.</div>
 <div class="cards" id="cards"></div>
@@ -542,6 +554,9 @@ h2{font-size:13px;font-weight:700;margin:16px 0 8px;opacity:.85}
 <h2>By app — stay-length distribution</h2>
 <div id="apps"></div>
 <script>
+function post(m){ try{ window.webkit.messageHandlers.dashboard.postMessage(m); }catch(e){} }
+document.getElementById("x").onclick = function(){ post("close"); };
+document.getElementById("rf").onclick = function(){ post("refresh"); };
 const DATA = __DATA__;
 const PALETTE = ["#3b82f6","#14b8a6","#f59e0b","#ef4444","#8b5cf6","#ec4899","#22c55e","#f97316","#06b6d4","#a3a380"];
 const LOCK = "#9ca3af";
@@ -585,8 +600,24 @@ local function openDashboard()
   local html = DASHBOARD_HTML:gsub("__DATA__", function() return dashboardJSON() end)
   local sf = hs.screen.mainScreen():frame()
   local rect = { x = sf.x + (sf.w - 900) / 2, y = sf.y + (sf.h - 680) / 2, w = 900, h = 680 }
-  local wv = hs.webview.new(rect)
-  wv:windowTitle("Screen Timer — Dashboard (menu item or Esc closes)")
+  -- JS bridge for the on-panel ✕ / ↻ buttons (v3.11). If the usercontent
+  -- API is unavailable, fall back to a plain webview (toggle/Esc still work).
+  local ucc = nil
+  pcall(function()
+    ucc = hs.webview.usercontent.new("dashboard")
+    ucc:setCallback(function(msg)
+      local body = (type(msg) == "table" and msg.body) or msg
+      if body == "close" then
+        openDashboard() -- toggle off
+      elseif body == "refresh" then
+        if SCREEN_TIMER and SCREEN_TIMER.webview then
+          SCREEN_TIMER.webview:html(DASHBOARD_HTML:gsub("__DATA__", function() return dashboardJSON() end))
+        end
+      end
+    end)
+  end)
+  local wv = ucc and hs.webview.new(rect, ucc) or hs.webview.new(rect)
+  wv:windowTitle("Screen Timer — Dashboard")
   pcall(function() wv:closeOnEscape(true) end)
   pcall(function()
     wv:windowCallback(function(action)
