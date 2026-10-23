@@ -356,6 +356,241 @@ local function stats()
   return lines
 end
 
+-- ===================== Dashboard (v3.9) =====================
+-- The menu is text-only (no color, proportional font). The dashboard is
+-- the pretty layer: an hs.webview panel with a colored day timeline and
+-- per-app stay histograms, Stats-app style. Data comes from today's CSV
+-- rows (so it survives config reloads), plus the in-progress stay.
+
+local function csvParseLine(line)
+  local fields, i, n = {}, 1, #line
+  while i <= n do
+    local c = line:sub(i, i)
+    if c == '"' then
+      local buf, j = {}, i + 1
+      while j <= n do
+        local ch = line:sub(j, j)
+        if ch == '"' then
+          if line:sub(j + 1, j + 1) == '"' then buf[#buf + 1] = '"'; j = j + 2
+          else j = j + 1; break end
+        else buf[#buf + 1] = ch; j = j + 1 end
+      end
+      fields[#fields + 1] = table.concat(buf)
+      if line:sub(j, j) == "," then i = j + 1 else i = n + 1 end
+    else
+      local j = line:find(",", i, true)
+      if j then fields[#fields + 1] = line:sub(i, j - 1); i = j + 1
+      else fields[#fields + 1] = line:sub(i); i = n + 1 end
+    end
+  end
+  return fields
+end
+
+local function jsonEsc(s)
+  return (tostring(s):gsub('[%z\1-\31\\"]', function(c)
+    if c == '"' then return '\\"' end
+    if c == "\\" then return "\\\\" end
+    return string.format("\\u%04x", c:byte())
+  end))
+end
+
+local function dayStaysFromCSV()
+  local today = os.date("%Y-%m-%d")
+  local f = io.open(CONFIG.logPath, "r")
+  if not f then return {} end
+  local out = {}
+  for line in f:lines() do
+    if line:sub(1, 10) == today then
+      local fld = csvParseLine(line)
+      -- end_time,app,window_id,window_title,ax_title,duration_seconds
+      if #fld >= 6 then
+        local y, mo, d, h, mi, s = fld[1]:match("(%d+)-(%d+)-(%d+) (%d+):(%d+):(%d+)")
+        local dur = tonumber(fld[6])
+        if y and dur then
+          local endT = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d),
+            hour = tonumber(h), min = tonumber(mi), sec = tonumber(s) })
+          out[#out + 1] = { app = fld[2], title = fld[4], ax = fld[5],
+            dur = dur, startT = endT - dur, endT = endT }
+        end
+      end
+    end
+  end
+  f:close()
+  table.sort(out, function(a, b) return a.startT < b.startT end)
+  return out
+end
+
+local function dashboardJSON()
+  local stays = dayStaysFromCSV()
+  -- append the in-progress stay so the panel is live
+  if currentApp ~= "" then
+    local now = os.time()
+    stays[#stays + 1] = { app = currentApp, title = currentTitle, ax = currentAx,
+      dur = now - startTime, startT = startTime, endT = now, live = true }
+  end
+  local apps, order = {}, {}
+  local totalActive, lockedTotal = 0, 0
+  local durations = {}
+  for _, st in ipairs(stays) do
+    if st.app == "loginwindow" then
+      lockedTotal = lockedTotal + st.dur
+    else
+      totalActive = totalActive + st.dur
+      durations[#durations + 1] = st.dur
+      local a = apps[st.app]
+      if not a then
+        a = { name = st.app, total = 0, secs = {}, buckets = { 0, 0, 0, 0, 0, 0 }, subs = {} }
+        apps[st.app] = a; order[#order + 1] = a
+      end
+      a.total = a.total + st.dur
+      a.secs[#a.secs + 1] = st.dur
+      for i, b in ipairs(BUCKETS) do
+        if st.dur >= b[2] and st.dur <= b[3] then a.buckets[i] = a.buckets[i] + 1; break end
+      end
+      local label
+      if st.ax ~= "" then label = st.ax:match("^(.-) %- ") or st.ax
+      elseif st.title ~= "" then label = st.title
+      else label = "(untitled window)" end
+      local s = a.subs[label]
+      if not s then s = { label = label, count = 0, total = 0 }; a.subs[label] = s end
+      s.count = s.count + 1; s.total = s.total + st.dur
+    end
+  end
+  table.sort(order, function(x, y) return x.total > y.total end)
+  table.sort(durations)
+  local focusCount, focusTotal, flutter = 0, 0, 0
+  for _, d in ipairs(durations) do
+    if d >= 1500 then focusCount = focusCount + 1; focusTotal = focusTotal + d end
+    if d < 30 then flutter = flutter + 1 end
+  end
+  local dayStart = os.time({ year = tonumber(os.date("%Y")), month = tonumber(os.date("%m")),
+    day = tonumber(os.date("%d")), hour = 0, min = 0, sec = 0 })
+  local p = {}
+  p[#p + 1] = '{"date":"' .. os.date("%a %b %d") .. '","dayStart":' .. dayStart ..
+    ',"now":' .. os.time() .. ',"stats":{"stays":' .. #durations ..
+    ',"active":' .. totalActive .. ',"locked":' .. lockedTotal ..
+    ',"median":' .. medianOf(durations) ..
+    ',"longest":' .. (durations[#durations] or 0) ..
+    ',"focusCount":' .. focusCount .. ',"focusTotal":' .. focusTotal ..
+    ',"flutterPct":' .. (#durations > 0 and math.floor(flutter / #durations * 100 + 0.5) or 0) .. '},"apps":['
+  local appChunks = {}
+  for _, a in ipairs(order) do
+    local subs = {}
+    for _, s in pairs(a.subs) do subs[#subs + 1] = s end
+    table.sort(subs, function(x, y) return x.total > y.total end)
+    local subChunks = {}
+    for i, s in ipairs(subs) do
+      if i > 6 then break end
+      subChunks[#subChunks + 1] = '{"label":"' .. jsonEsc(s.label) .. '","count":' .. s.count .. ',"total":' .. s.total .. '}'
+    end
+    appChunks[#appChunks + 1] = '{"name":"' .. jsonEsc(a.name) .. '","total":' .. a.total ..
+      ',"count":' .. #a.secs .. ',"median":' .. medianOf(a.secs) ..
+      ',"buckets":[' .. table.concat(a.buckets, ",") .. '],"subs":[' .. table.concat(subChunks, ",") .. ']}'
+  end
+  p[#p + 1] = table.concat(appChunks, ",")
+  p[#p + 1] = '],"timeline":['
+  local tlChunks = {}
+  for _, st in ipairs(stays) do
+    tlChunks[#tlChunks + 1] = '{"app":"' .. jsonEsc(st.app) .. '","start":' .. st.startT ..
+      ',"end":' .. st.endT .. (st.live and ',"live":true' or '') .. '}'
+  end
+  p[#p + 1] = table.concat(tlChunks, ",")
+  p[#p + 1] = "]}"
+  return table.concat(p)
+end
+
+local DASHBOARD_HTML = [==[
+<!DOCTYPE html><html><head><meta charset="utf-8"><style>
+:root{color-scheme:light dark}
+*{box-sizing:border-box;margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
+body{padding:18px 20px;background:Canvas;color:CanvasText}
+h1{font-size:19px;font-weight:700;margin-bottom:2px}
+.sub{opacity:.55;font-size:12px;margin-bottom:14px}
+.cards{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.card{flex:1;min-width:105px;border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:10px 12px}
+.card .v{font-size:20px;font-weight:700}
+.card .k{font-size:11px;opacity:.6;text-transform:uppercase;letter-spacing:.04em;margin-top:2px}
+h2{font-size:13px;font-weight:700;margin:16px 0 8px;opacity:.85}
+.tl{position:relative;height:44px;border-radius:8px;background:rgba(128,128,128,.12);overflow:hidden}
+.seg{position:absolute;top:0;bottom:0;min-width:1px}
+.seg.live{opacity:.55}
+.tlaxis{display:flex;justify-content:space-between;font-size:10px;opacity:.5;margin-top:3px}
+.legend{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;margin-top:8px}
+.legend span{display:inline-flex;align-items:center;gap:5px}
+.dot{width:9px;height:9px;border-radius:3px;display:inline-block}
+.app{border:1px solid rgba(128,128,128,.25);border-radius:12px;padding:12px 14px;margin-bottom:10px}
+.apphead{display:flex;align-items:baseline;gap:8px;margin-bottom:8px}
+.appname{font-size:15px;font-weight:700}
+.appmeta{font-size:12px;opacity:.6}
+.hist{display:flex;align-items:flex-end;gap:6px;height:64px;margin:4px 0 2px}
+.col{flex:1;display:flex;flex-direction:column;align-items:center;gap:3px;height:100%;justify-content:flex-end}
+.bar{width:100%;border-radius:4px 4px 0 0;min-height:2px}
+.col .n{font-size:11px;font-weight:600}
+.col .b{font-size:10px;opacity:.55}
+.subs{margin-top:8px;border-top:1px solid rgba(128,128,128,.18);padding-top:7px}
+.subs div{display:flex;justify-content:space-between;font-size:12px;padding:1.5px 0}
+.subs .t{opacity:.6;white-space:nowrap;margin-left:14px}
+.subs .l{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+</style></head><body>
+<h1>Screen Timer — <span id="date"></span></h1>
+<div class="sub">Stays so far today. The panel reflects the moment it was opened — reopen to refresh.</div>
+<div class="cards" id="cards"></div>
+<h2>Day timeline</h2>
+<div class="tl" id="tl"></div>
+<div class="tlaxis"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>now</span></div>
+<div class="legend" id="legend"></div>
+<h2>By app — stay-length distribution</h2>
+<div id="apps"></div>
+<script>
+const DATA = __DATA__;
+const PALETTE = ["#3b82f6","#14b8a6","#f59e0b","#ef4444","#8b5cf6","#ec4899","#22c55e","#f97316","#06b6d4","#a3a380"];
+const LOCK = "#9ca3af";
+const colorOf = {}; let ci = 0;
+function color(app){ if(app==="loginwindow") return LOCK; if(!(app in colorOf)) colorOf[app]=PALETTE[ci++ % PALETTE.length]; return colorOf[app]; }
+function fmt(s){ s=Math.round(s); if(s<3600) return String(Math.floor(s/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0"); return Math.floor(s/3600)+":"+String(Math.floor(s%3600/60)).padStart(2,"0")+":"+String(s%60).padStart(2,"0"); }
+function hm(t){ const d=new Date(t*1000); return String(d.getHours()).padStart(2,"0")+":"+String(d.getMinutes()).padStart(2,"0"); }
+document.getElementById("date").textContent = DATA.date;
+const st = DATA.stats;
+const cards = [["Stays", st.stays],["Active", fmt(st.active)],["Median stay", fmt(st.median)],["Longest", fmt(st.longest)],
+  ["Focus ≥25m", st.focusCount+" · "+fmt(st.focusTotal)],["Stays <30s", st.flutterPct+"%"]];
+if(st.locked>0) cards.push(["Locked", fmt(st.locked)]);
+document.getElementById("cards").innerHTML = cards.map(c=>'<div class="card"><div class="v">'+c[1]+'</div><div class="k">'+c[0]+'</div></div>').join("");
+const span = Math.max(DATA.now - DATA.dayStart, 3600);
+document.getElementById("tl").innerHTML = DATA.timeline.map(s=>{
+  const l=((s.start-DATA.dayStart)/span*100).toFixed(2), w=Math.max((s.end-s.start)/span*100,0.15).toFixed(2);
+  return '<div class="seg'+(s.live?" live":"")+'" style="left:'+l+'%;width:'+w+'%;background:'+color(s.app)+'" title="'+s.app.replace(/"/g,"")+" · "+hm(s.start)+"–"+hm(s.end)+" · "+fmt(s.end-s.start)+'"></div>';
+}).join("");
+document.getElementById("legend").innerHTML = [...new Set(DATA.timeline.map(s=>s.app))].map(a=>'<span><i class="dot" style="background:'+color(a)+'"></i>'+a+"</span>").join("");
+const BUCKETS = ["<10s","10–30s","30s–2m","2–10m","10–25m","≥25m"];
+document.getElementById("apps").innerHTML = DATA.apps.map(a=>{
+  const max = Math.max(...a.buckets, 1);
+  const cols = a.buckets.map((n,i)=>'<div class="col"><div class="n">'+(n||"")+'</div><div class="bar" style="height:'+Math.max(n/max*44, n?3:1.5)+'px;background:'+color(a.name)+'"></div><div class="b">'+BUCKETS[i]+'</div></div>').join("");
+  const subs = a.subs.length>1 ? '<div class="subs">'+a.subs.map(s=>'<div><span class="l">'+s.label.replace(/</g,"&lt;")+'</span><span class="t">'+s.count+" stays · "+fmt(s.total)+"</span></div>").join("")+"</div>" : "";
+  return '<div class="app"><div class="apphead"><span class="appname">'+a.name.replace(/</g,"&lt;")+'</span><span class="appmeta">'+a.count+" stays · "+fmt(a.total)+" total · median "+fmt(a.median)+'</span></div><div class="hist">'+cols+"</div>"+subs+"</div>";
+}).join("");
+</script></body></html>
+]==]
+
+local function openDashboard()
+  local html = DASHBOARD_HTML:gsub("__DATA__", function() return dashboardJSON() end)
+  if SCREEN_TIMER and SCREEN_TIMER.webview then
+    local wv = SCREEN_TIMER.webview
+    wv:html(html)
+    wv:show()
+    wv:bringToFront(true)
+    return
+  end
+  local sf = hs.screen.mainScreen():frame()
+  local rect = { x = sf.x + (sf.w - 900) / 2, y = sf.y + (sf.h - 680) / 2, w = 900, h = 680 }
+  local wv = hs.webview.new(rect)
+  wv:windowTitle("Screen Timer — Dashboard")
+  wv:html(html)
+  wv:show()
+  wv:bringToFront(true)
+  SCREEN_TIMER = SCREEN_TIMER or {}
+  SCREEN_TIMER.webview = wv
+end
+
 local function tick()
   local key, name, title, winId, axTitle = frontmost()
   if key ~= currentKey then
@@ -388,7 +623,8 @@ if menubar then
       end
     end
     items[#items + 1] = { title = "-" }
-    items[#items + 1] = { title = "Open log (CSV)", fn = function() os.execute('open "' .. CONFIG.logPath .. '"') end }
+    items[#items + 1] = { title = "Open dashboard", fn = function() local ok, err = pcall(openDashboard); if not ok then hs.alert.show("Dashboard error: " .. tostring(err)) end end },
+    { title = "Open log (CSV)", fn = function() os.execute('open "' .. CONFIG.logPath .. '"') end }
     items[#items + 1] = { title = "Reset timer now", fn = function() startTime = os.time() end }
     return items
   end)

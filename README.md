@@ -6,7 +6,9 @@ switch. For Chrome apps / PWAs (which have no window title) it reads the
 in-app session name via Accessibility, so session switches inside a PWA
 reset the timer too.
 
-Click the timer for today's summary: stays overall, per app, and within
+Click the timer and choose **Open dashboard** for a Stats-style panel:
+colored day timeline, per-app stay-length histograms, focus stats.
+The menu itself also shows a text summary: stays overall, per app, and within
 an app — per tab in Chrome, per session in PWAs, per window elsewhere.
 Each app lists its top 6 tabs/sessions; the rest roll up into one line.
 Every finished stay is logged to `~/screen-stays.csv`. Everything is
