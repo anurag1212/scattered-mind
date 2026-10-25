@@ -614,7 +614,9 @@ local function openDashboard()
         openDashboard() -- toggle off
       elseif body == "refresh" then
         if SCREEN_TIMER and SCREEN_TIMER.webview then
-          SCREEN_TIMER.webview:html(DASHBOARD_HTML:gsub("__DATA__", function() return dashboardJSON() end))
+          -- parens are load-bearing: gsub returns (string, count) and the
+          -- bare call forwarded the count as :html()'s 3rd argument
+          SCREEN_TIMER.webview:html((DASHBOARD_HTML:gsub("__DATA__", function() return dashboardJSON() end)))
         end
       end
     end)
