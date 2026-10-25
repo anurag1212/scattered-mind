@@ -65,9 +65,9 @@ local CONFIG = {
   granularity = "app+window+title", -- "app+window+title" | "app+window" | "app"
   logPath = os.getenv("HOME") .. "/screen-stays.csv",
   minLogSeconds = 2,           -- don't log accidental <2s flickers
-  nameWidth = 18,              -- menu bar: name field is exactly this many
-                               -- chars (padded, or cut with …). The clock
-                               -- after it is never truncated. (v3.12)
+  maxNameChars = 10,           -- menu bar: name shown at natural width,
+                               -- cut with … only when longer than this.
+                               -- The clock after it is never cut. (v3.14)
 }
 
 local menubar = hs.menubar.new()
@@ -674,19 +674,19 @@ local function tick()
   -- Chrome apps: label with the session (first segment of the AX title)
   local display = name
   if axTitle ~= "" then display = axTitle:match("^(.-) %- ") or axTitle end
-  -- Fixed-width name field (v3.12): pad short names, cut long ones with
-  -- an ellipsis, so the clock never moves and is never truncated.
-  local function fixedName(s, width)
+  -- Natural-width name (v3.14): short names stay short — no padding.
+  -- Only names longer than CONFIG.maxNameChars are cut, with an
+  -- ellipsis; the total shown never exceeds maxNameChars. (v3.12 padded
+  -- to a fixed 18 chars; the user disliked the gaps.)
+  local function truncName(s, max)
     local okLen, len = pcall(function() return utf8.len(s) end)
     if not okLen or not len then len = #s end
-    if len > width then
-      local okCut, cut = pcall(function() return s:sub(1, utf8.offset(s, width) - 1) end)
-      if okCut and cut then return cut .. "…" end
-      return s:sub(1, width - 1) .. "…"
-    end
-    return s .. string.rep(" ", width - len)
+    if len <= max then return s end
+    local okCut, cut = pcall(function() return s:sub(1, utf8.offset(s, max) - 1) end)
+    if okCut and cut then return cut .. "…" end
+    return s:sub(1, max - 1) .. "…"
   end
-  local label = fixedName(display, CONFIG.nameWidth) .. " " .. fmt(os.time() - startTime)
+  local label = truncName(display, CONFIG.maxNameChars) .. " " .. fmt(os.time() - startTime)
   if menubar then menubar:setTitle("◉ " .. label) end
 end
 
